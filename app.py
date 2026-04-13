@@ -280,9 +280,6 @@
 
 
 
-
-#!/usr/bin/env python3
-
 # ================================
 # IMPORTS
 # ================================
@@ -302,65 +299,49 @@ from pathlib import Path
 from PIL import Image
 from sentence_transformers import SentenceTransformer
 from groq import Groq
-
-# OCR - reads text from images locally (no API needed, no installation needed)
 import easyocr
 
-# Load EasyOCR once (English language)
 ocr_reader = easyocr.Reader(['en'], gpu=False)
 
 # ================================
 # CONFIG
 # ================================
-
-# Groq API key - reads from Streamlit secrets on cloud, env variable locally
 try:
     GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 except:
     GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+    # GROQ_API_KEY = ""
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Meme folder - works on both local and Streamlit Cloud
 MEME_FOLDER = "memes"
+INDEX_FILE  = "meme_index.faiss"
+META_FILE   = "meme_meta.pkl"
 
-# Files to save the index so we don't rebuild every time
-INDEX_FILE = "meme_index.faiss"
-META_FILE  = "meme_meta.pkl"
-
-# Sentence embedder for search
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 
 # ================================
-# STEP 1 — LOAD ALL IMAGES
+# LOAD IMAGES
 # ================================
-
 def load_images(folder):
-    """Find all image files in the memes folder"""
     folder = Path(folder)
     extensions = ["*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"]
-
     images = []
     for ext in extensions:
         images += list(folder.rglob(ext))
-
     return list(set(images))
 
 
 # ================================
-# STEP 2 — SKIP DUPLICATE IMAGES
+# DUPLICATE CHECK
 # ================================
-
 def is_duplicate(image_path, seen_hashes):
-    """Check if we already have this image (even if filename is different)"""
     try:
         img = Image.open(image_path)
-        h = imagehash.average_hash(img)  # fingerprint of the image
-
+        h = imagehash.average_hash(img)
         if h in seen_hashes:
-            return True  # already seen this image
-
+            return True
         seen_hashes.add(h)
         return False
     except:
@@ -368,225 +349,151 @@ def is_duplicate(image_path, seen_hashes):
 
 
 # ================================
-# STEP 3 — OCR: READ TEXT FROM IMAGE
+# OCR
 # ================================
-
 def extract_text_with_ocr(image_path):
-    """Use EasyOCR to read any text inside the meme image — runs locally, no API cost"""
     try:
         results = ocr_reader.readtext(str(image_path))
-        # Each result is [bbox, text, confidence] — we just want the text
         text = " ".join([r[1] for r in results]).strip()
-        return text[:300]  # limit to 300 characters to save tokens
+        return text[:300]
     except:
-        return ""  # if OCR fails, return empty string
+        return ""
 
 
 # ================================
-# STEP 4 — GROQ LLM: ANALYZE MEME
+# GROQ ANALYSIS (FIXED + RETRY)
 # ================================
-
 def analyze_with_groq(image_path, ocr_text):
-    """
-    Send image + OCR text to Groq LLM.
-    OCR already got the text so Groq only needs to understand the visual.
-    This saves ~60% tokens compared to asking Groq to do everything.
-    """
 
-    # Build prompt — include OCR text so Groq doesn't waste tokens re-reading it
-    prompt = f"""You are a meme analyzer.
+    prompt = f"""
+You are a meme analyzer.
 
-The text already extracted from this meme via OCR is:
+Meme text:
 "{ocr_text}"
 
-Look at the image and return ONLY this JSON (no extra text, no markdown):
+Return ONLY JSON:
 {{
   "text_in_image": "{ocr_text}",
-  "visual_description": "",
-  "category": "",
-  "emotion": "",
-  "keywords": [],
-  "summary": "",
-  "title": "",
-  "funniness": 5
+  "visual_description": "short description",
+  "category": "relatable/dark/dad joke/etc",
+  "emotion": "funny/sad/angry/etc",
+  "keywords": ["k1", "k2", "k3"],
+  "summary": "one sentence meaning",
+  "title": "short title",
+  "funniness": 1-10
 }}
-
-- category: type of meme (dark humor, relatable, dad joke, political, etc.)
-- emotion: main feeling (funny, sad, angry, wholesome, etc.)
-- keywords: 3-5 relevant search words as a list
-- summary: one sentence explaining the joke or meaning
-- title: short catchy name for this meme
-- funniness: integer 1 (boring) to 10 (hilarious)
 """
 
-    # Try up to 3 times in case of temporary rate limiting
     for attempt in range(3):
         try:
-            # Convert image to base64 so Groq can see it
-            img = Image.open(image_path)
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-
-            buffer = io.BytesIO()
-            img.save(buffer, format="JPEG")
-            b64_image = base64.b64encode(buffer.getvalue()).decode()
-
-            # Call Groq API
             response = groq_client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text",      "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
-                    ]
-                }],
-                max_tokens=200  # reduced because OCR already got the text
+                model="llama-3.3-70b-versatile",  # ✅ GOOD MODEL
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=200
             )
 
-            result = safe_json_parse(response.choices[0].message.content)
-
-            # Always keep OCR text even if Groq missed it
-            if not result.get("text_in_image") and ocr_text:
-                result["text_in_image"] = ocr_text
-
-            return result
+            return safe_json_parse(response.choices[0].message.content)
 
         except Exception as e:
-            error_msg = str(e)
-            print(f"Attempt {attempt + 1} failed: {error_msg}")
+            print(f"❌ GROQ ERROR (attempt {attempt+1}):", e)
+            time.sleep(3)
 
-            if "rate_limit" in error_msg.lower() or "429" in error_msg:
-                wait_seconds = (attempt + 1) * 10  # 10s, 20s, 30s
-                print(f"Rate limited — waiting {wait_seconds}s...")
-                time.sleep(wait_seconds)
-            else:
-                time.sleep(3)
+    print("⚠️ Using fallback metadata")
 
-    # If all 3 attempts fail — still return OCR text so meme is not lost
     return {
-        "text_in_image":      ocr_text,
+        "text_in_image": ocr_text,
         "visual_description": "",
-        "category":           "general",
-        "emotion":            "unknown",
-        "keywords":           ocr_text.split()[:5] if ocr_text else [],
-        "summary":            ocr_text[:100] if ocr_text else "failed",
-        "title":              Path(image_path).stem.replace("-", " ").title(),
-        "funniness":          5
+        "category": "general",
+        "emotion": "unknown",
+        "keywords": ocr_text.split()[:5] if ocr_text else [],
+        "summary": ocr_text[:100],
+        "title": Path(image_path).stem,
+        "funniness": 5
     }
 
-
 # ================================
-# HELPER — SAFELY PARSE JSON
+# JSON PARSER
 # ================================
-
 def safe_json_parse(text):
-    """Clean up Groq response and parse as JSON"""
     text = re.sub(r"```json|```", "", text).strip()
     try:
         return json.loads(text)
     except:
         return {
-            "text_in_image":      "",
+            "text_in_image": "",
             "visual_description": text[:200],
-            "category":           "general",
-            "emotion":            "unknown",
-            "keywords":           [],
-            "summary":            text[:200],
-            "title":              "",
-            "funniness":          5
+            "category": "general",
+            "emotion": "unknown",
+            "keywords": [],
+            "summary": text[:200],
+            "title": "",
+            "funniness": 5
         }
 
 
 # ================================
-# STEP 5 — BUILD SEARCH TEXT
+# BUILD SEARCH TEXT
 # ================================
-
 def build_search_text(data):
-    """Combine all meme info into one string for the search embedder"""
     return " ".join([
-        data.get("text_in_image",      ""),
+        data.get("text_in_image", ""),
         data.get("visual_description", ""),
-        data.get("category",           ""),
-        data.get("emotion",            ""),
-        " ".join(data.get("keywords",  [])),
-        data.get("summary",            ""),
-        data.get("title",              ""),
-        str(data.get("funniness",      ""))
+        data.get("category", ""),
+        data.get("emotion", ""),
+        " ".join(data.get("keywords", [])),
+        data.get("summary", ""),
+        data.get("title", ""),
+        str(data.get("funniness", ""))
     ])
 
 
 # ================================
-# STEP 6 — BUILD FAISS INDEX
+# BUILD INDEX (GRADIO STYLE PATH)
 # ================================
-
 @st.cache_resource(show_spinner=False)
 def build_index(folder):
-    """
-    Builds the searchable index.
-    - If saved index exists on disk → loads it instantly
-    - Otherwise → processes all memes one by one and saves the result
-    """
 
-    # Load saved index if it exists (fast path)
     if Path(INDEX_FILE).exists() and Path(META_FILE).exists():
         index = faiss.read_index(INDEX_FILE)
         with open(META_FILE, "rb") as f:
             metadata = pickle.load(f)
         return index, metadata
 
-    # Build fresh index (slow path — only runs once)
-    images      = load_images(folder)
-    vectors     = []
-    metadata    = []
+    images = load_images(folder)
+    vectors = []
+    metadata = []
     seen_hashes = set()
 
-    progress_bar = st.progress(0, text="Building meme index…")
-    total        = len(images)
+    for img_path in images:
 
-    for i, img_path in enumerate(images):
-
-        progress_bar.progress(
-            (i + 1) / max(total, 1),
-            text=f"Processing {img_path.name} ({i+1}/{total})"
-        )
-
-        # Skip duplicate images
         if is_duplicate(img_path, seen_hashes):
-            print(f"Skipping duplicate: {img_path.name}")
             continue
 
-        # STEP A: OCR reads text from image (free, local, fast)
         ocr_text = extract_text_with_ocr(img_path)
-
-        # STEP B: Groq analyzes image (uses OCR text to save tokens)
-        time.sleep(2)  # 2 second pause to avoid rate limiting
         data = analyze_with_groq(img_path, ocr_text)
 
-        # STEP C: Create search vector
         search_text = build_search_text(data)
-        vector      = embedder.encode(search_text).astype("float32")
+        vector = embedder.encode(search_text).astype("float32")
 
         vectors.append(vector)
-        metadata.append({
-            "path":     str(img_path),
-            "filename": img_path.name,
-            "data":     data
-        })
 
-    progress_bar.empty()
+        # 🔥 GRADIO STYLE PATH
+        metadata.append({
+            "path": str(img_path.as_posix()),  # 🔥 IMPORTANT FIX,   # e.g. memes/funny.jpg
+            "data": data
+        })
 
     if not vectors:
         return None, None
 
-    # Build FAISS vector index
     vectors = np.array(vectors).astype("float32")
     faiss.normalize_L2(vectors)
 
     index = faiss.IndexFlatIP(vectors.shape[1])
     index.add(vectors)
 
-    # Save to disk so next run loads instantly
     faiss.write_index(index, INDEX_FILE)
     with open(META_FILE, "wb") as f:
         pickle.dump(metadata, f)
@@ -595,11 +502,9 @@ def build_index(folder):
 
 
 # ================================
-# STEP 7 — SEARCH FUNCTION
+# SEARCH
 # ================================
-
 def search(query, index, metadata, k=6):
-    """Search memes using natural language"""
     query_vector = embedder.encode(query).astype("float32").reshape(1, -1)
     faiss.normalize_L2(query_vector)
 
@@ -609,7 +514,7 @@ def search(query, index, metadata, k=6):
     for i, idx in enumerate(indices[0]):
         if idx == -1:
             continue
-        item          = dict(metadata[idx])
+        item = dict(metadata[idx])
         item["score"] = float(scores[0][i])
         results.append(item)
 
@@ -619,102 +524,31 @@ def search(query, index, metadata, k=6):
 # ================================
 # STREAMLIT UI
 # ================================
+st.set_page_config(page_title="Meme Finder 🐸", layout="wide")
 
-st.set_page_config(page_title="Meme Finder 🐸", page_icon="🐸", layout="wide")
+st.title("🐸 Meme Finder")
 
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Bangers&family=DM+Sans:wght@400;600&display=swap');
-:root{--bg:#0e0e0e;--card:#1a1a1a;--accent:#f7c948;--accent2:#ff4d6d;--text:#f0f0f0;--muted:#888;}
-html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;color:var(--text)!important;}
-[data-testid="stHeader"]{background:transparent!important;}
-h1{font-family:'Bangers',cursive!important;font-size:3.5rem!important;letter-spacing:3px;color:var(--accent)!important;}
-.meme-card{background:var(--card);border:1px solid #2a2a2a;border-radius:12px;padding:12px;margin-bottom:16px;}
-.meme-card:hover{border-color:var(--accent);}
-.meme-title{font-family:'Bangers',cursive;font-size:1.3rem;color:var(--accent);letter-spacing:1px;margin:8px 0 4px;}
-.badge{display:inline-block;padding:2px 10px;border-radius:20px;font-size:0.75rem;font-weight:600;margin-right:6px;}
-.badge-cat{background:#2a2a2a;color:var(--accent);}
-.badge-emo{background:#2a2a2a;color:#a78bfa;}
-.badge-fun{background:#2a2a2a;color:var(--accent2);}
-.score-bar-wrap{background:#2a2a2a;border-radius:6px;height:6px;margin:6px 0;}
-.score-bar{background:var(--accent);border-radius:6px;height:6px;}
-.summary-text{font-size:0.85rem;color:var(--muted);margin-top:6px;}
-.stTextInput>div>div>input{background:#1a1a1a!important;color:var(--text)!important;border:2px solid #333!important;border-radius:10px!important;padding:12px 16px!important;}
-.stButton>button{background:var(--accent)!important;color:#000!important;font-family:'Bangers',cursive!important;font-size:1.1rem!important;border:none!important;border-radius:10px!important;padding:10px 28px!important;}
-</style>
-""", unsafe_allow_html=True)
+index, metadata = build_index(MEME_FOLDER)
 
-st.markdown('<h1>🐸 MEME FINDER</h1>', unsafe_allow_html=True)
-st.markdown('<p style="color:#888">Search your meme stash with plain English</p>', unsafe_allow_html=True)
+query = st.text_input("Search memes")
 
-# Build or load index
-with st.spinner("Loading meme index…"):
-    index, metadata = build_index(MEME_FOLDER)
+if query:
+    results = search(query, index, metadata)
 
-if index is None:
-    st.error("No memes found! Check your memes folder.")
-    st.stop()
+    cols = st.columns(3)
 
-st.success(f"✅ {len(metadata)} memes ready!")
+    for i, r in enumerate(results):
+        with cols[i % 3]:
+            img_path = r.get("path", "").replace("\\", "/")
+            st.write("DEBUG PATH:", img_path)
 
-# Search bar
-col1, col2 = st.columns([5, 1])
-with col1:
-    query = st.text_input("Search", placeholder='Try: "dark humor", "dad jokes", "relatable"…', label_visibility="collapsed")
-with col2:
-    search_btn = st.button("SEARCH 🔍")
+            if os.path.exists(img_path):
+                st.image(img_path, use_container_width=True)
+            else:
+                st.warning(f"Missing: {img_path}")
 
-k = st.slider("Results to show", 3, 12, 6)
+            d = r["data"]
 
-# Show results
-if (search_btn or query) and query.strip():
-    results = search(query.strip(), index, metadata, k=k)
-
-    if not results:
-        st.warning("No results found. Try a different query.")
-    else:
-        st.markdown(f"### Top {len(results)} memes for **\"{query}\"**")
-        cols = st.columns(3)
-
-        for i, r in enumerate(results):
-            with cols[i % 3]:
-                st.markdown('<div class="meme-card">', unsafe_allow_html=True)
-
-                # Show image — works on local and Streamlit Cloud
-                try:
-                    img_name = Path(r["path"]).name
-                    img_path = Path("memes") / img_name
-                    if img_path.exists():
-                        st.image(str(img_path), use_container_width=True)
-                    else:
-                        st.warning(f"❌ {img_name}")
-                except:
-                    st.warning("Image error")
-
-                # Show metadata
-                d         = r["data"]
-                title     = d.get("title",     "Untitled") or "Untitled"
-                category  = d.get("category",  "?")        or "?"
-                emotion   = d.get("emotion",   "?")        or "?"
-                funniness = d.get("funniness", "?")
-                summary   = d.get("summary",   "")         or ""
-                score     = r.get("score", 0)
-
-                st.markdown(f'<div class="meme-title">{title}</div>', unsafe_allow_html=True)
-                st.markdown(
-                    f'<span class="badge badge-cat">📁 {category}</span>'
-                    f'<span class="badge badge-emo">😶 {emotion}</span>'
-                    f'<span class="badge badge-fun">😂 {funniness}/10</span>',
-                    unsafe_allow_html=True
-                )
-
-                pct = int(score * 100)
-                st.markdown(
-                    f'<div class="score-bar-wrap"><div class="score-bar" style="width:{pct}%"></div></div>',
-                    unsafe_allow_html=True
-                )
-
-                if summary:
-                    st.markdown(f'<div class="summary-text">{summary}</div>', unsafe_allow_html=True)
-
-                st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown(f"**{d.get('title', 'Untitled')}**")
+            st.write(f"📂 {d.get('category')} | 😂 {d.get('funniness')}/10")
+            st.write(d.get("summary", ""))
