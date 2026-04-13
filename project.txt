@@ -1,0 +1,51 @@
+1. Load images
+2. Convert image → text (caption)
+3. Store text + image path
+4. Convert text → embeddings
+5. Store in vector DB (FAISS)
+6. User query → embedding
+7. Similarity search
+8. Return image paths
+
+
+
+
+            ┌──────────────────────────┐
+            │   Meme Image Folder       │
+            └──────────┬───────────────┘
+                       ↓
+        ┌────────────────────────────────┐
+        │ 1. Image Loader + Dedup Filter │
+        └──────────┬─────────────────────┘
+                       ↓
+        ┌────────────────────────────────┐
+        │ 2. Image → LLM Vision Caption  │
+        │    + Metadata Extraction       │
+        └──────────┬─────────────────────┘
+                       ↓
+        ┌────────────────────────────────┐
+        │ 3. Text Preprocessing (NLP)    │
+        │   clean + keyword extraction   │
+        └──────────┬─────────────────────┘
+                       ↓
+        ┌────────────────────────────────┐
+        │ 4. Embeddings (Sentence-BERT)  │
+        └──────────┬─────────────────────┘
+                       ↓
+        ┌────────────────────────────────┐
+        │ 5. Vector DB (FAISS)           │
+        │   store: vector + metadata     │
+        └──────────┬─────────────────────┘
+                       ↓
+        ┌────────────────────────────────┐
+        │ 6. User Query (NLP expand)     │
+        └──────────┬─────────────────────┘
+                       ↓
+        ┌────────────────────────────────┐
+        │ 7. Similarity Search (RAG)     │
+        └──────────┬─────────────────────┘
+                       ↓
+        ┌────────────────────────────────┐
+        │ 8. Return Top Meme Paths       │
+        │ + metadata (bonus output)      │
+        └────────────────────────────────┘
